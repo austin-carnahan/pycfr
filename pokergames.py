@@ -1,3 +1,4 @@
+from card import Card
 from pokertrees import *
 
 def kuhn_eval(hc, board):
