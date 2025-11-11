@@ -525,3 +525,195 @@ class OutcomeSamplingCFR(ChanceSamplingCFR):
             if action == i:
                 immediate_cfr += ev
             self.counterfactual_regret[root.player][infoset][i] += immediate_cfr
+
+
+class RetrospectiveSamplingCFR(ChanceSamplingCFR):
+    """
+    Retrospective Sampling CFR (RS-CFR).
+    Combines Outcome Sampling with retrospective lookback:
+    - Samples one path down the tree (Outcome Sampling)
+    - Looks back k action nodes and samples one additional alternative action
+    - Updates regrets for the retrospective node
+    """
+    def __init__(self, rules, lookback_depth=1, exploration=0.4):
+        ChanceSamplingCFR.__init__(self, rules)
+        self.lookback_depth = lookback_depth  # How many action nodes to look back
+        self.exploration = exploration
+        self.action_path = []  # Track (node, action, reachprobs, sampleprobs) during descent
+
+    def cfr(self):
+        # Sample all cards to be used
+        holecards_per_player = sum([x.holecards for x in self.rules.roundinfo])
+        boardcards_per_hand = sum([x.boardcards for x in self.rules.roundinfo])
+        todeal = random.sample(self.rules.deck, boardcards_per_hand + holecards_per_player * self.rules.players)
+        # Deal holecards
+        self.holecards = [tuple(todeal[p*holecards_per_player:(p+1)*holecards_per_player]) for p in range(self.rules.players)]
+        self.board = tuple(todeal[-boardcards_per_hand:])
+        # Set the top card of the deck
+        self.top_card = len(todeal) - boardcards_per_hand
+        
+        # Reset path tracking for this iteration
+        self.action_path = []
+        
+        # Call the standard CFR algorithm (with path tracking)
+        payoffs = self.cfr_helper(self.tree.root, [1 for _ in range(self.rules.players)], 1.0)
+        
+        # NEW: Retrospective sampling step
+        if len(self.action_path) >= self.lookback_depth:
+            self.retrospective_sample()
+        
+        return payoffs
+
+    def cfr_helper(self, root, reachprobs, sampleprobs):
+        if type(root) is TerminalNode:
+            return self.cfr_terminal_node(root, reachprobs, sampleprobs)
+        if type(root) is HolecardChanceNode:
+            return self.cfr_holecard_node(root, reachprobs, sampleprobs)
+        if type(root) is BoardcardChanceNode:
+            return self.cfr_boardcard_node(root, reachprobs, sampleprobs)
+        return self.cfr_action_node(root, reachprobs, sampleprobs)
+
+    def cfr_terminal_node(self, root, reachprobs, sampleprobs):
+        payoffs = [0 for _ in range(self.rules.players)]
+        for hands,winnings in root.payoffs.items():
+            if not self.terminal_match(hands):
+                continue
+            for player in range(self.rules.players):
+                prob = 1.0
+                for opp,hc in enumerate(hands):
+                    if opp != player:
+                        prob *= reachprobs[opp]
+                payoffs[player] = prob * winnings[player] / sampleprobs
+            return payoffs
+
+    def cfr_holecard_node(self, root, reachprobs, sampleprobs):
+        assert(len(root.children) == 1)
+        return self.cfr_helper(root.children[0], reachprobs, sampleprobs)
+    
+    def cfr_boardcard_node(self, root, reachprobs, sampleprobs):
+        # Number of community cards dealt this round
+        num_dealt = len(root.children[0].board) - len(root.board)
+        # Find the child that matches the sampled board card(s)
+        for bc in root.children:
+            if self.boardmatch(num_dealt, bc):
+                # Perform normal CFR
+                results = self.cfr_helper(bc, reachprobs, sampleprobs)
+                # Return the payoffs
+                return results
+        raise Exception('Sampling from impossible board card')
+
+    def cfr_action_node(self, root, reachprobs, sampleprobs):
+        # Calculate strategy from counterfactual regret
+        strategy = self.cfr_strategy_update(root, reachprobs, sampleprobs)
+        hc = self.holecards[root.player][0:len(root.holecards[root.player])]
+        infoset = self.rules.infoset_format(root.player, hc, root.board, root.bet_history)
+        action_probs = strategy.probs(infoset)
+        if random.random() < self.exploration:
+            action = self.random_action(root)
+        else:
+            action = strategy.sample_action(infoset)
+        
+        # Track this action node before recursing (for retrospective sampling)
+        self.action_path.append((root, action, deepcopy(reachprobs), sampleprobs, action_probs))
+        
+        reachprobs[root.player] *= action_probs[action]
+        csp = self.exploration * (1.0 / len(root.children)) + (1.0 - self.exploration) * action_probs[action]
+        payoffs = self.cfr_helper(root.get_child(action), reachprobs, sampleprobs * csp)
+        # Update regret calculations
+        self.cfr_regret_update(root, payoffs[root.player], action, action_probs[action])
+        payoffs[root.player] *= action_probs[action]
+        return payoffs
+    
+    def retrospective_sample(self):
+        """
+        Look back in the action path and sample one alternative action at EACH depth.
+        With lookback_depth=k, this adds k additional samples (one per depth).
+        Total samples per iteration: 1 original + k retrospective = (k+1) samples.
+        """
+        # Iterate through each lookback depth from 1 to lookback_depth
+        for depth in range(1, self.lookback_depth + 1):
+            # Check if we have enough action nodes in the path
+            if len(self.action_path) < depth:
+                continue  # Not enough history yet
+            
+            # Get the retrospective node at this depth
+            retro_node, original_action, retro_reachprobs, retro_sampleprobs, original_action_probs = \
+                self.action_path[-depth]
+            
+            # Find available alternative actions (not the one originally taken)
+            alternative_actions = []
+            for a in [FOLD, CALL, RAISE]:
+                if retro_node.valid(a) and a != original_action:
+                    alternative_actions.append(a)
+            
+            if not alternative_actions:
+                continue  # No alternatives available at this depth
+            
+            # Sample ONE alternative action uniformly
+            alt_action = random.choice(alternative_actions)
+            
+            # Update reach probabilities for this alternative path
+            alt_reachprobs = deepcopy(retro_reachprobs)
+            alt_reachprobs[retro_node.player] *= original_action_probs[alt_action]
+            
+            # Calculate sample probability for the alternative action
+            alt_csp = self.exploration * (1.0 / len(retro_node.children)) + \
+                      (1.0 - self.exploration) * original_action_probs[alt_action]
+            alt_sampleprobs = retro_sampleprobs * alt_csp
+            
+            # Evaluate this alternative branch (this will recurse down ONE path)
+            child_node = retro_node.get_child(alt_action)
+            alt_payoffs = self.cfr_helper(child_node, alt_reachprobs, alt_sampleprobs)
+            
+            # Update regrets for the retrospective node based on this alternative sample
+            self.cfr_regret_update(retro_node, alt_payoffs[retro_node.player], 
+                                  alt_action, original_action_probs[alt_action])
+
+    def random_action(self, root):
+        options = []
+        if root.fold_action:
+            options.append(FOLD)
+        if root.call_action:
+            options.append(CALL)
+        if root.raise_action:
+            options.append(RAISE)
+        return random.choice(options)
+
+    def cfr_strategy_update(self, root, reachprobs, sampleprobs):
+        # Update the strategies and regrets for each infoset
+        hc = self.holecards[root.player][0:len(root.holecards[root.player])]
+        infoset = self.rules.infoset_format(root.player, hc, root.board, root.bet_history)
+        # Get the current CFR
+        prev_cfr = self.counterfactual_regret[root.player][infoset]
+        # Get the total positive CFR
+        sumpos_cfr = float(sum([max(0,x) for x in prev_cfr]))
+        if sumpos_cfr == 0:
+            # Default strategy is equal probability
+            probs = self.equal_probs(root)
+        else:
+            # Use the strategy that's proportional to accumulated positive CFR
+            probs = [max(0,x) / sumpos_cfr for x in prev_cfr]
+        # Use the updated strategy as our current strategy
+        self.current_profile.strategies[root.player].policy[infoset] = probs
+        # Update the weighted policy probabilities (used to recover the average strategy)
+        for i in range(3):
+            self.action_reachprobs[root.player][infoset][i] += reachprobs[root.player] * probs[i] / sampleprobs
+        if sum(self.action_reachprobs[root.player][infoset]) == 0:
+            # Default strategy is equal weight
+            self.profile.strategies[root.player].policy[infoset] = self.equal_probs(root)
+        else:
+            # Recover the weighted average strategy
+            self.profile.strategies[root.player].policy[infoset] = [self.action_reachprobs[root.player][infoset][i] / sum(self.action_reachprobs[root.player][infoset]) for i in range(3)]
+        # Return and use the current CFR strategy
+        return self.current_profile.strategies[root.player]
+
+    def cfr_regret_update(self, root, ev, action, actionprob):
+        hc = self.holecards[root.player][0:len(root.holecards[root.player])]
+        infoset = self.rules.infoset_format(root.player, hc, root.board, root.bet_history)
+        for i in range(3):
+            if not root.valid(i):
+                continue
+            immediate_cfr = -ev * actionprob
+            if action == i:
+                immediate_cfr += ev
+            self.counterfactual_regret[root.player][infoset][i] += immediate_cfr
